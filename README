@@ -1,0 +1,44 @@
+Finance/Shares/MySQL
+====================
+
+This module holds a series of stock quotes obtained from Finance::Shares::MySQL.
+It makes this data available for the other modelling Finance::Share modules and
+provides facilities for graphing the results using PostScript::Graph::Stock.
+
+INSTALLATION
+
+To install this module type the following:
+
+   perl Makefile.PL
+   make
+   make test
+   make install
+
+DEPENDENCIES
+
+This module requires these other modules and libraries:
+
+  Date::Pcalc
+  PostScript::Graph::Style
+  PostScript::Graph::Stock
+  Finance::Shares::Log
+  Finance::Shares::MySQL
+
+TESTING
+
+The automated tests are minimal.  The 't' directory has some scripts which you
+may trim to your setup.  There is no real way of testing this module without
+having a mysql database available for the Finance::Shares::MySQL module to
+interact with.  I would be grateful for any ideas on this or any other matter.
+
+COPYRIGHT AND LICENCE
+
+Copyright (C) 2002 Christopher P Willmot.  All rights reserved.
+
+This work is published under the Artistic licence accompanying the Perl
+distribution which may be found at http://www.perl.org.  
+
+There is no warranty whatsoever.  Use at your own risk.  Just because it is here
+and is documented does not mean that it is fit for any purpose implied by the
+code or accompanying documentation.  
+
