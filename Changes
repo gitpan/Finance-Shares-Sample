@@ -1,5 +1,23 @@
 Revision history for Perl extension Finance::Shares::Sample.
 
+0.02	Wed Nov 20 12:16:01 GMT 2002
+	Now Carps
+	plines, vlines and alines now use pseudohash fields
+	Added function hashes used by tests
+	Now can work with prices other than closing
+	Simplified options to just 'source'
+	Data now fetched in constructor
+	Documented publicly available data
+	Added documentation to new()
+	add...line() methods added
+	Support for non-display of data
+	Added line_data() method
+	Tidied up {dtype} tangle in prepare_dates()
+	'days' now means 'data'; added 'alldays' for old 'days'
+	Added {idx}, {prices} and {volumes}
+	Added known_date(), eval_data(), eval_line(), line_key()
+	show_lines() uses a format
+
 0.01	Sun Nov 10 12:02:17 2002
 	- original version; created by h2xs 1.21 with options
 		-X -n Finance::Shares::Sample

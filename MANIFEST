@@ -1,7 +1,9 @@
 Changes
-Makefile.PL
 MANIFEST
+Makefile.PL
 README
 Sample.pm
 t/01minimal.t
-
+t/02simple.pl
+t/03csv.t
+t/shell.csv

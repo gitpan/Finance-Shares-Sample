@@ -1,9 +1,9 @@
-Finance/Shares/MySQL
-====================
+Finance/Shares/Sample
+=====================
 
-This module holds a series of stock quotes obtained from Finance::Shares::MySQL.
-It makes this data available for the other modelling Finance::Share modules and
-provides facilities for graphing the results using PostScript::Graph::Stock.
+A Sample here is a series of stock quote data for a particular share over
+a specific period.  It holds a central place in the Finance::Shares:: family,
+as most other packages either feed data to it or analyse data from it.
 
 INSTALLATION
 
@@ -18,18 +18,13 @@ DEPENDENCIES
 
 This module requires these other modules and libraries:
 
+  Text::CSV_XS
   Date::Pcalc
+  PostScript::File
   PostScript::Graph::Style
   PostScript::Graph::Stock
   Finance::Shares::Log
   Finance::Shares::MySQL
-
-TESTING
-
-The automated tests are minimal.  The 't' directory has some scripts which you
-may trim to your setup.  There is no real way of testing this module without
-having a mysql database available for the Finance::Shares::MySQL module to
-interact with.  I would be grateful for any ideas on this or any other matter.
 
 COPYRIGHT AND LICENCE
 

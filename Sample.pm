@@ -1,14 +1,36 @@
 package Finance::Shares::Sample;
 use strict;
 use warnings;
-use Finance::Shares::MySQL;
+use fields;
+use Carp;
+use Text::CSV_XS;
 use Date::Pcalc qw(:all);
+use PostScript::File qw(check_file);
 use PostScript::Graph::Stock;
 use PostScript::Graph::Style;
+use Finance::Shares::Log qw(ymd_from_string string_from_ymd);
+use Finance::Shares::MySQL;
 
 our @ISA = qw(Exporter);
-our @EXPORT_OK = qw(ymd_from_string string_from_ymd);
-our $VERSION = 0.01;
+our @EXPORT_OK = qw(%linefunc %bandfunc %timefunc %evalfunc line_key);
+our $VERSION = 0.02;
+
+# Pseudohash keys for plines, vlines and alines entries
+our @line_fields = qw(data style key show);
+
+# All Finance::Shares::Sample test and line generating functions
+# provided by other modules must register here as key => fn ref.
+our %linefunc;	    # build line data sets;	args= (sample, strict, show, chart, period, style)
+our %bandfunc;	    # build bounds around line; args= (sample, strict, show, chart, func, period, band_arg, style)
+our %timefunc;	    # get period from params;	args= (strict, period, band_arg)
+our %evalfunc;	    # get value for a date;	args= (sample, chart, date, func, param)
+
+our %pricepos = (
+	line_key('price','open')  => 0,
+	line_key('price','high')  => 1,
+	line_key('price','low')   => 2,
+	line_key('price','close') => 3,
+    );
 
 =head1 NAME
 
@@ -24,53 +46,60 @@ Finance::Shares::Sample - Price data on a single share
 
 Graph a series of stock quotes.
 
-    my $db = new Finance::Shares::MySQL( user => 'me' );
-    
-    my $s = new Finance::Shares::Sample(
-	    mysql	=> $db,
-	    epic	=> 'GSK.L',
-	    start_date	=> '2002-08-01',
-	    end_date	=> '2002-08-31',
-	);
+    my $ss = new Finance::Shares::Sample(
+		source	    => 'gsk,csv',
+		epic  => 'GSK.L',
+	    );
 
-    $s->output( 'Glaxo' );
+    $ss->output( 'Glaxo' );
 
 =head2 Typical
 
 Get a series of stock quotes and graph them using specific settings.  Calculate some trend lines from the
 Finance::Shares::Sample data and superimpose them on the graph.
 
-    my $psfile = new PostScript::File(
-	    landscape => 1,
-	    paper => 'A4',
-	);
-	
     my $s = new Finance::Shares::Sample(
-	    mysql => {
+	    source => {
 		user	 => 'guest',
 		password => 'a94Hq',
 		database => 'London',
 	    },
 	    
-	    by		 => 'weeks',
-	    epic	 => 'GSK.L',
-	    start_date	 => '2001-09-01',
-	    end_date	 => '2002-08-31'
+	    dates_by   => 'weeks',
+	    epic => 'GSK.L',
+	    start_date => '2001-09-01',
+	    end_date   => '2002-08-31'
+
+	    graph => {
+		file => {
+		    landscape => 1,
+		    paper => 'A4',
+		},
+		heading	   => 'GlaxoSmithKline',
+		background => [1, 1, 0.9],
+		color	   => [0, 0, 0.8],
+		
+		price => {
+		    percent => 50,
+		},
+		
+		analysis => {
+		    percent => 30,
+		    low	    => -100,
+		    high    => 100,
+		},
+		
+		volume => {
+		    percent => 20,
+		},
+	    },
+
+	    lines => {
+		color => [1, 0, 0],
+	    },
 	);
 
-    my $graph = $s->graph(
-	    file	     => $psfile,
-	    heading	     => 'GlaxoSmithKline',
-	    background	     => [1, 1, 0.9],
-	    color	     => [0, 0, 0.8],
-	    price_percent    => 50,
-	    volume_percent   => 20,
-	    analysis_percent => 30,
-	    analysis_low     => -100,
-	    analysis_high    => 100,
-	);
-
-    # construct data for lines
+    # construct data for lines, and then...
     $graph->add_price_line( $line1, 'Support' );
     $graph->add_volume_line( $line2, 'Average' );
     $graph->add_analysis_line( $line3, 'RSI' );
@@ -80,11 +109,269 @@ Finance::Shares::Sample data and superimpose them on the graph.
 =head1 DESCRIPTION
 
 This module is principally a data structure holding stock quotes.  Price and volume data are held for a particular
-share over a specified period.  It is possible to graph the data together with other, user-calculated lines.
+share over a specified period.  This data can be read from a CSV file or from an array, but more usually it is
+fetched from Finance::Shares::MySQL which in turn handles getting the data from the internet.
+
+Facilities are provided to graph the data together with other, user-calculated lines.
 
 All options can be given to the constructor, or to seperate B<fetch> and B<graph> functions.  This module
 cooperates closely with Finance::Shares::MySQL and PostScript::Graph::Stock.  See those manpages for further
 details.
+
+=head2 The Data
+
+This object is used as a data structure common to a number of modules.  Therefore, unusually, most of the internal
+data is made available directly.  The hash and array refs documented here can be relied upon to exist as soon as the
+object has been constructed, although C<dates>, C<prices> and C<volumes> are by far the most useful.  Other values
+are made available for reading, but changing them will probably cause chaos.
+
+=head3 alines
+
+An array of all data sets derived for the analysis chart section.  See L<plines>.
+
+=head3 dates
+
+An array ref indicating a list of dates in YYYY-MM-DD format.  These are the dates of all known data points.  If
+any prices exist, there should be one for each date.  If any volumes exist, there should be one for each date.
+
+=head3 dtype
+
+The value given to 'dates_by' (etc.) controlling how the data is distributed.  One of 'days', 'weekdays',
+'alldays', 'weeks', 'months'.
+
+=head3 idx
+
+A hash ref acting as an index into the C<dates>, C<prices> or C<volumes> arrays.
+
+    my $s = new Finance::Shares::Sample(...);
+    
+    my $i = $s->{idx}{'2002-09-01'};
+    my $closing_price = $s->{prices}[$i];
+
+This is the same as the following:
+
+    my $closing_price = $s->{price}{'2002-09-01'}[3];
+
+The first method would be best for comparing closing prices with the days before and after, while the second would
+be better to compare the closing price with the highest of the day.
+    
+=head3 labels
+
+An array ref indicating a label for each line across a PostScript::Graph::Stock chart.  Some of these labels may
+be blank (or a single space) if there is too little room to show them all.  Not every label has data associated
+with it e.g. weekends when 'days' are specified.
+
+=head3 lblmax
+
+A scalar holding the length of the longest label.  Used by PostScript::Graph::Stock.
+
+=head3 order
+
+A hash ref.  Keyed by YYYY-MM-DD dates, there is an entry for each C<date> known.  The value is the label number.
+Used to convert dates to points on a PostScript::Graph::Stock chart.
+
+=head3 plines
+
+An array of all data sets derived from the prices.  Each entry is a pseudo-hash with the following keys:
+
+=over 8
+
+=item data
+
+An array ref similar to C<prices> or C<volumes>.
+
+=item style
+
+Either a PostScript::Graph::Style object or a hash ref holding options for one.
+
+=item key
+
+The string to be shown next to the style in the chart's Key.
+
+=item show
+
+True if to be drawn, false otherwise.
+
+=item func
+
+String identifying the function creating the data.
+
+=item params
+
+Any parameters passed to C<func> which are needed to uniquely identify the line.
+
+=back
+
+=head3 price
+
+A hash ref.  Keyed by YYYY-MM-DD dates, the values are array refs indicating (open, high, low, close) prices.
+
+Note that some of the entries here may be aggregates.  For example, when processing the data by 'weeks', Friday's
+values are over-written with the week's averages.  The C<closes> array should be used when analysing price data.
+These values are held for plotting each days' spread on a PostScript::Graph::Stock chart.
+
+=head3 prices
+
+An array ref indicating the closing price (if any) for every C<date> known.  This is the data that should be
+processed when analysing price movement.  Each entry has the form:
+
+    [ 'YYYY-MM-DD', price ]
+
+=head3 vlines
+
+An array of all data sets derived from the volume data.  See L<plines>.
+
+=head3 volume
+
+A hash ref keyed by YYYY-MM-DD dates and used while preparing the data (See C<price>).  Use the C<volumes> array
+when analysing volume data.
+
+=head3 volumes
+
+An array ref.  If volume data was read in there should be a value here corresponding with each date in the
+C<dates> array.  Each entry has the form:
+
+    [ 'YYYY-MM-DD', volume ]
+
+=head2 Managing Styles
+
+Often the data will be output as a graph in PostScript format.  The PostScript::Graph::Stock object used for this
+provides facilities ensuring that each line drawn on each chart is different from the previous one.
+
+Lines can be given styles directly.  See L<PostScript::Graph::Style> for details.  However each graph also has
+a PostScript::Graph::Sequence which is used unless the style option C<auto => 'none'> is given.  How the styles
+vary can be altered in two ways.  It is possible to change the order of change using B<auto> or the values of the
+settings themselves using B<setup>.
+
+B<Example 1>
+
+    my $sample = new Finance::Shares::Sample(
+	    price_lines => {
+		line	=> {},
+	    },
+	);
+    my $graph = $sample->graph();
+    my $sequence = $graph->price_sequence();
+    
+    $sequence->setup( 'red',   [1, 0.75, 0.5] );
+    $sequence->setup( 'green', [0.4, 0.8] );
+    $sequence->setup( 'blue', [0.1] );
+    $sequence->auto( 'green', 'red', 'blue' );
+
+    # prepare line data
+    $sample->add_price_line($data1, 'One');
+    $sample->add_price_line($data2, 'Two');
+    $sample->add_price_line($data3, 'Three');
+    $sample->add_price_line($data4, 'Four');
+    
+    $sample->output( 'graph' );
+
+The four lines added to the price chart will be in various shades of orange.  There are a few things to notice
+about this example.
+
+=over 4
+
+=item B<*>
+
+The order is important.  The sequence settings must be made before any lines are added.
+
+=item B<*>
+
+Six colours are generated in this sequence, all combinations of 3 red and 2 green.  If more than six lines were
+drawn, the styles would be repeated.
+
+=item B<*>
+
+The green settings vary fastest.  The colours generated would be, in order:
+
+    Red	    Green   Blue
+    1.0	    0.4	    0.1
+    1.0	    0.8	    0.1
+    0.75    0.4	    0.1
+    0.75    0.8	    0.1
+    0.5	    0.4	    0.1
+    0.5	    0.8	    0.1
+
+=item B<*>
+
+There is no need to specify a style provided both lines and points are wanted.  In fact, there is no need to
+specify the sequence data either.  However, the defaults assume a minimal black and white printer.
+
+If a hash of style options is given to each line, remember to set up line and/or point sub-hashes, even if they
+are empty.  It is the presence of these sub-hashes which determines whether each gets drawn.  In this example,
+only lines are drawn on the price line - no points.
+
+=item B<*>
+
+In practice the data for the lines would be constructed by another module such as Finance::Shares::Averages.
+These support modules add lines in the right way.
+
+=item B<*>
+
+Finally, notice that price_sequence() is used with add_price_line().  Use the right sequence to control the lines.
+    
+=back
+
+There is no need to be limited to one sequence.  It is possible to have most of the lines controlled by one
+sequence but special indicators having their own styles.
+
+B<Example 2>
+
+    my $sample = new Finance::Shares::Sample(
+	    price_lines => {
+		color	=> 0.5,
+		line	=> {},
+	    },
+	);
+
+    # prepare line data
+    $sample->add_price_line($data1, 'One');
+    $sample->add_price_line($data2, 'Two');
+    
+    my $style2 = {
+		color	=> [1, 0, 0],
+		dashes	=> [],
+	    };
+	    
+    $sample->add_price_line($data3, 'Three', $style2);
+    $sample->add_price_line($data4, 'Four');
+
+In this example lines One, Two and Four will be grey, with different dash patterns.  Line Three will be in solid
+red.
+
+However, when a PostScript::Graph::Style object is used (rather than a hash ref), it is necessary to explicitly
+specify the sequence.
+
+B<Example 3>
+
+    my $sample = new Finance::Shares::Sample(
+	    price_lines => {
+		color	=> 0.5,
+		line	=> {},
+	    },
+	);
+
+    # prepare line data
+    $sample->add_price_line($data1, 'One');
+    $sample->add_price_line($data2, 'Two');
+    
+    my $graph = $sample->graph();
+    my $sequence = $graph->price_sequence();
+    my $style2 = new PostScript::Graph::Style(
+		sequence => $sequence,
+		color	 => [1, 0, 0],
+		dashes	 => [],
+	    );
+    $sequence->reset();
+	    
+    $sample->add_price_line($data3, 'Three', $style2);
+    $sample->add_price_line($data4, 'Four');
+
+Passing a style object is the only way of giving the same style to more than one line (boundary lines for
+example).  Notice the reset command after $style2 is created.  The other styles are not created until B<output> is
+called, so they would otherwise start with the second default.
+
+See L<PostScript::Graph::Style> for details on what is available.
 
 =head1 CONSTRUCTOR
 
@@ -98,50 +385,174 @@ sub new {
     my $o = {};
     bless( $o, $class );
     $o->{opt} = $opt;
-
-    ## register database
-    if (defined $opt->{mysql}) {
-	if (ref($opt->{mysql}) eq 'Finance::Shares::MySQL') {
-	    $o->{db} = $opt->{mysql};
-	} else {
-	    $o->{dir} = $opt->{mysql}{directory};
-	    $o->{db} = new Finance::Shares::MySQL( $opt->{mysql} );
-	}
-    }
+    $o->{plines} = {};
+    $o->{vlines} = {};
+    $o->{alines} = {};
 
     ## option defaults
-    $o->{pi2}	 = 2 * atan2(1,1);
-    $o->{angeps} = defined($opt->{angle_epsilon}) ? $opt->{angle_epsilon} : 0.05;
-    $o->{angdev} = $o->{pi2} * $o->{angeps};
-    $o->{prceps} = defined($opt->{price_epsilon}) ? $opt->{price_epsilon} : 0.05;
-    $o->{score}  = defined($opt->{threshold})     ? $opt->{threshold}     : 2;
-    
-    $o->{tries}  = defined($opt->{tries})  ? $opt->{tries}  : 3;
-    $o->{dtype}  = defined($opt->{by})     ? $opt->{by}     : 'data';
-    $o->{ignore} = defined($opt->{ignore}) ? $opt->{ignore} : 1;
-    
-    $opt->{dates} = {} unless defined ($opt->{dates});
-    my $od = $opt->{dates};
-    $od->{show_year} = 0           unless (defined $od->{show_year});
-    $od->{by}        = $o->{dtype} unless (defined $od->{by});
-    $o->{dtype} = $od->{by};
-    
-    $o->{seq} = new PostScript::Graph::Sequence;
-    
-    ## fetch and process data
-    $o->fetch($opt->{epic}, $opt->{start_date}, $opt->{end_date}, $opt->{table}) if (defined $opt->{epic});
+    $o->{tries}  = defined($opt->{tries})    ? $opt->{tries}    : 3;
+    $o->{strict} = defined($opt->{strict})   ? $opt->{strict}   : 0;
+    $o->{show}   = defined($opt->{show})     ? $opt->{show}     : 1;
+   
+    $opt->{graph} = {}		unless defined $opt->{graph};
+    $opt->{graph}{dates} = {}	unless defined $opt->{graph}{dates};
+    my $od = $opt->{graph}{dates};
+    $od->{show_year} = 0	unless defined $od->{show_year};
+    $o->{dtype} = defined($od->{by}) ? $od->{by} : $opt->{dates_by} || 'data';
+   
+    # line style options
+    $opt->{lines} = {}		unless defined $opt->{lines};
 
+    ## fetch and process data
+    carp "'epic' must be specified\n"   unless defined($opt->{epic});
+    carp "'source' must be specified\n" unless defined($opt->{source});
+    my $type = ref($opt->{source});
+    CASE: {
+	if ($type eq 'Finance::Shares::MySQL') {
+	    $o->{db} = $opt->{source};
+	    carp "'start_date' must be specified\n" unless defined($opt->{start_date});
+	    carp "'end_date' must be specified\n"   unless defined($opt->{end_date});
+	    $o->fetch( $opt->{epic}, $opt->{start_date}, $opt->{end_date}, $opt->{table} );
+	    last CASE;
+	}
+	if ($type eq 'HASH') {
+	    $o->{db} = new Finance::Shares::MySQL( $opt->{source} );
+	    carp "'start_date' must be specified\n" unless defined($opt->{start_date});
+	    carp "'end_date' must be specified\n"   unless defined($opt->{end_date});
+	    $o->fetch( $opt->{epic}, $opt->{start_date}, $opt->{end_date}, $opt->{table} );
+	    last CASE;
+	}
+	if ($type eq 'ARRAY') {
+	    $o->from_array( $opt->{epic}, $opt->{source} );
+	    last CASE;
+	}
+	if (not $type) {
+	    $o->from_csv( $opt->{epic}, $opt->{source}, $opt->{directory} );
+	    last CASE;
+	}
+    }
+   
+    ## finish
+    croak "Finance::Shares::Sample has no data\nStopped" unless ($o->{dates} and @{$o->{dates}});
+    
     return $o;
 }
 
 =head2 new( [options] )
 
-C<options> can be a hash ref or a list of hash keys and values (or omitted altogether).  Recognized keys are:
+C<options> can be a hash ref or a list of hash keys and values (or omitted altogether).  
 
-=head3 by
+C<source> and C<epic> must be specified, with C<start_date> and C<end_date> also required if the source is
+a mysql database.
 
-Control how the data are stored.  Suitable values are 'data', 'days', 'workdays', 'weeks', 'months'.  (Default:
-'data')
+Recognized keys are:
+
+=head3 source
+
+This can be a Finances::Shares::MySQL object or a hash ref holding options suitable for creating one.
+Alternatively it may be the name of a CSV file or an array ref holding similar data.
+
+Example 1
+
+Using an existing MySQL object.
+
+    my $db = new Finance::Shares::MySQL;	    
+    my $ss = new Finance::Shares::Sample (
+		source => $db,
+	    );
+
+Example 2
+
+Creating our own MySQL connection.
+
+    my $ss = new Finance::Shares::Sample (
+		source => {
+		    user     => 'wally',
+		    password => '123jiM',
+		    database => 'London',
+		},
+	    );
+
+Several attempts (see C<tries> below) are made to fetch the data from the internet (see L<Finance::Shares::MySQL/fetch_batch>).  Then the
+data is extracted from the MySQL database, filtered according to C<opts> and stored as date, price and volume
+data.
+
+!Yahoo Finance provide a suitable source of CSV files in the right format.  If that is what you want you might
+like to look at L<Finance::Shares::MySQL> and L<Finance::Shares::Sample>.
+
+The CSV file is read and converted to price and/or volume data, as appropriate.  The comma seperated values are
+interpreted by Text::CSV_XS and so are currently unable to tolerate white space.  See the C<array> option for
+how the field contents are handled.
+
+Optionally, the directory may be specified seperately.
+
+Example 3
+
+    my $ss = new Finance::Shares::Sample (
+		source => 'quotes.csv',
+		directory => '~/shares',
+	    );
+
+If C<source> is an array ref it should point to a list of arrays with fields date, open, high, low, close and volume.
+
+Example 4
+
+    my $data = [
+    ['2002-08-01',645.13,645.13,586.00,606.36,33606236],
+    ['2002-08-02',574.75,620.88,558.00,573.00,59618288],
+    ['2002-08-05',589.88,589.88,560.11,572.42,20300730],
+    ['2002-08-06',571.89,599.00,545.30,585.92,26890880],
+    ['2002-08-07',565.11,611.00,560.11,567.11,24977940] ];
+    
+    my $ss = new Finance::Shares::Sample ( 
+		source => $data,
+	    );
+
+Three formats are recognized:
+
+    Date, Open, High, Low, Close, Volume
+    Date, Open, High, Low, Close
+    Date, Volume
+
+Examples
+
+    [2001-04-26, 345, 400, 300, 321, 12345678],
+    [Apr-1-01, 234.56, 240.00, 230.00, 239.99],
+    [13/4/01, 987654],
+
+The first field must be a date.  Attempts are made to recognize the format in turn:
+
+=over 4
+
+=item 1
+
+The Finance::Shares::MySQL format is tried first, YYYY-MM-DD.
+
+=item 2
+
+European format dates are tried next using Date::Pcalc's Decode_Date_EU().
+
+=item 3
+
+Finally US dates are tried, picking up the !Yahoo format, Mar-01-99.
+
+=back
+
+The four price values are typically decimals and the volume is usually an integer in the millions.  If the option
+C<dates> is I<weeks> the average price and volume data for the week is given under the last known day.  Average
+prices are also calculated for I<months>.
+
+=head3 dates_by
+
+Control how the data are stored.  Suitable values are 'days', 'weekdays', 'alldays', 'weeks', 'months'.  (Default:
+'days')
+
+Shortcut for:
+    dates =>{ by => ... }
+
+=head3 directory
+
+Specifies the directory, if C<file> is an unqualified file name.
 
 =head3 end_date
 
@@ -150,42 +561,56 @@ The last day of price data, in YYYY-MM-DD format.  Only used if C<epic> is given
 =head3 epic
 
 The market abbreviation for the stock.  The data is fetched from Yahoo, so there probably should be a suffix
-indicating the stock exchange (e.g. BSY.L for BSkyB on the London Stock Exchange).  If this is given, the stock
-data is fetched, so C<start_date>, C<end_date> and possibly C<table> should also be considered.  See L<fetch>.
+indicating the stock exchange (e.g. BSY.L for BSkyB on the London Stock Exchange).  
+
+If this is given, the stock data is fetched depending on which of C<mysql>, C<file> or C<array> is set.  Remember
+to include C<start_date>, C<end_date> and possibly C<table> if C<mysql> is being used.
 
 =head3 graph
 
-If present, the contents is used in a call to L<new_graph>.  It should be a sub hash containing options suitable
-for a PostScript::Graph::Stock object.  See L<PostScript::Graph::Stock,new>.
+If present, the contents is used in a call to L<graph>.  It should be reference to a hash containing options
+suitable for a PostScript::Graph::Stock object.  See L<PostScript::Graph::Stock/new>.
 
-=head3 mysql
+The hash referenced here contains a 'dates' key with a sub-hash value used by both this and the
+PostScript::Graph::Stock modules.  For details of the keys available within 'dates' see L<prepare_dates>.
 
-This can be either a reference to a Finance::Shares::MySQL object or a hash ref filled with options for creating one.
+=head3 lines
 
-Example 1
+A sub-hash containing style options for price, volume and/or analysis lines.  It is passed straight to
+Finance::Shares::Sample.  All PostScript::Graph::Style settings can be used within the three sub-hashes.  See
+L<Finance::Shares::Sample> for further details.
 
-Using an existing MySQL object.
+Example
 
-    my $db = new Finance::Shares::MySQL;	    
-    my $ss = new Finance::Shares::Sample (
-		mysql => $db,
-	    );
-
-Example 2
-
-Creating our own MySQL connection.
-
-    my $ss = new Finance::Shares::Sample (
-		mysql => {
-		    user     => 'wally',
-		    password => '123jiM',
-		    database => 'London',
+    my $ss = new Finance::Shares::Sample ( 
+		lines => {
+		    price => {
+		    },
+		    volume => {
+		    },
+		    analysis => {
+		    },
 		},
 	    );
+
+=head3 show
+
+Setting this to 0 prevents the PostScript::Graph::Stock graph from being created.  (Default: 1)
+
+Individual charts within the PostScript::Graph::Stock object can be hidden by setting their C<percent> option to 0.
 
 =head3 start_date
 
 The first day of price data, in YYYY-MM-DD format.  Only used if C<epic> is given.  See L<fetch>.
+
+=head3 strict
+
+A number of functions can behave strictly according to their definitions or run in a more relaxed way that might
+be more benficial.  For example, strictly a 20-day moving average does not exist for the first 20 days.  So with
+'strict' set to 1, the function doesn't exist for that period.  But if it is 0, the average so far is returned.
+Bollinger bands require 20 days of data from the function they follow.  With 'strict' set, there would have to be
+at least 40 days data before the first test could be made.  Without 'strict' a shorter period may be given to the
+Bollinger Band function, so this lead time might be reduced to 10 days.  (Default: 0)
 
 =head3 table
 
@@ -197,144 +622,124 @@ Specify the number of times an attempt is made to fetch the data from the intern
 
 =cut
 
-sub fetch {
-    my $o = shift;
-
-    ## prepare arguments
-    my $epic = shift;
-    my ($opt, $start, $end, $table) = shift;
-    my $tries = $o->{tries};
-    if (defined($opt) and ref($opt) eq "HASH") {
-	($start, $end, $table) = @_;
-	$tries = $opt->{tries} if (defined $opt->{tries});
-    } else {
-	$start = $opt;
-	$opt = $o->{opt}{dates};
-	($end, $table) = @_;
-    }
-    $epic = uc($epic);
-    ($table = $epic) =~ s/[^\w]/_/g unless $table;
-    $o->{epic}  = $epic;
-    $o->{table} = $table;
-    $o->{start} = $start;
-    $o->{end}   = $end;
-    
-    ## fetch from database
-    my $request = [ [ $epic, $start, $end, $table ], ];
-    for my $try (1 .. $tries) {
-	my $failed = $o->{db}->fetch_batch( $request );
-	last unless ($failed);
-    }
-    
-    $o->{cols} = [qw(Open High Low Close Volume)];
-    $o->{rows} = $o->{db}->select_table($table, $o->{cols}, $start, $end);
-    $o->prepare_dates($o->{rows}, $opt);
+sub add_price_line {
+    my ($o, $lineid, $data, $key, $style, $show) = @_;
+    croak "No data for price line\nStopped" unless $data;
+    croak "No key for price line\nStopped" unless $key;
+    my $entry = fields::phash( [@line_fields], [('') x 4] );
+    $entry->{data}   = $data;
+    $entry->{key}    = $key;
+    $entry->{style}  = defined($style) ? $style : $o->{opt}{lines};
+    $entry->{show}   = defined($show) ? $show : 1;
+    $o->{plines}{$lineid} = $entry;
 }
 
-=head2 fetch( epic [,opts] [,start [,end [,table]]] )
+=head2 add_price_line( lineid, data, key [, style [, show]] )
 
-=over 4
+=over 8
 
-=item C<epic>
+=item lineid
 
-The market abbreviation for the stock.  The data is fetched from Yahoo, so there probably should be a suffix
-indicating the stock exchange (e.g. BSY.L for BSkyB on the London Stock Exchange).
+A string uniquely identifying the line.
 
-=item C<opts>
+=item data
 
-If a hash ref is given here, it should be contain options for filtering dates.  See
-L<PostScript::Graph::Stock,prepare_dates>.  Note that this overrides any 'dates' hash given to B<new>.
+An array ref indicating a list of points.  Each point has a date and a price value.
 
-For convenience, an additional key 'tries' is allowed.  This is the same as (and overrides) the B<new> option of
-the same name.
+=item key
 
-=item C<start>
+The text to be shown next with the style in the Price Key box to the right of the chart.
 
-The first day of price data.  Defaults to the earliest data already fetched (or today's date if none).
+=item style
 
-=item C<end>
+This can either be a PostScript::Graph::Style object or a hash ref holding options for one.
 
-The last day of price data.  Defaults to today's date.
+=item show
 
-=item C<table>
-
-The name of the MySQL table to use.  By default this is the epic name in upper case with any non-word characters
-converted to underscores (e.g. BSY_L if the epic was 'bsy.l').
+True if to be drawn, false otherwise.
 
 =back
 
-Three attempts are made to fetch the data from the internet (see L<Finance::Shares::MySQL,fetch_batch>).  Then the
-data is extracted from the MySQL database, filtered according to C<opts> then stored as date, price and volume
-data.
+Add a line to the price chart to be drawn in the style specified identified by some key text.  See
+L<PostScript::Graph::Stock/add_price_line>.
 
 =cut
 
-sub graph {
-    my $o = shift;
-    my $opt = {};
-    if (@_ == 1) { $opt = $_[0]; } else { %$opt = @_; }
-
-    my $epic = $o->{epic};
-    die "No data, call fetch()\nStopped" unless (defined $epic);
-    my @date = $o->{end} ? ymd_from_string($o->{end}) : Today();
-    my $end_date = Date_to_Text_Long( @date );
-    my $dtype = ucfirst($o->{dtype});
-    $opt->{heading} = "$epic Shares, $dtype to $end_date";
-    $opt->{file}    = {} unless (defined $opt->{file});
-    my $of = $opt->{file};
-    $of->{landscape} = 1 unless (defined $of->{landscape});
-    $of->{errors}    = 1 unless (defined $of->{errors});
-    
-    $o->{pgs} = new PostScript::Graph::Stock( $opt );
-    $o->{pgs}->data_from_sample( $o );
-
-    return $o->{pgs};
+sub add_volume_line {
+    my ($o, $lineid, $data, $key, $style, $show) = @_;
+    croak "No data for volume line\nStopped" unless $data;
+    croak "No key for volume line\nStopped" unless $key;
+    my $entry = fields::phash( [@line_fields], [('') x 4] );
+    $entry->{data}   = $data;
+    $entry->{key}    = $key;
+    $entry->{style}  = defined($style) ? $style : $o->{opt}{lines};
+    $entry->{show}   = defined($show) ? $show : 1;
+    $o->{vlines}{$lineid} = $entry;
 }
 
-=head2 graph( [options] )
+=head2 add_volume_line( lineid, data, key [, style [, show]] )
 
-C<options> can be a hash ref or a list of hash keys and values. It should contain options suitable
-for a PostScript::Graph::Stock object, which is returned.  See L<PostScript::Graph::Stock,new>.
+See L<add_price_line>.
 
-Example
+=cut
 
-    my $sample = new Finance::Shares::Sample(...);
-    $sample->fetch( $epic, $start_date, $end_date );
-    
-    my $graph = $ss->new_graph(...);
+sub add_analysis_line {
+    my ($o, $lineid, $data, $key, $style, $show) = @_;
+    croak "No data for analysis line\nStopped" unless $data;
+    croak "No key for analysis line\nStopped" unless $key;
+    my $entry = fields::phash( [@line_fields], [('') x 4] );
+    $entry->{data}   = $data;
+    $entry->{key}    = $key;
+    $entry->{style}  = defined($style) ? $style : $o->{opt}{lines};
+    $entry->{show}   = defined($show) ? $show : 1;
+    $o->{alines}{$lineid} = $entry;
+}
 
-    # perhaps add lines to graph
-    $graph->add_price_line($data, $style, $key);
+=head2 add_analysis_line( data, key [, style [, show [, func, params]]] )
 
-    $sample->output( $epic );
+See L<add_price_line>.
 
-For details of constructing the line data see L<PostScript::Graph::Stock,add_price_line>.
+=cut
 
-Note that the options given here override any given to the constructor.  In particular, it is possible to get into
-a mess with the 'dates' or 'by' settings.  The data is filtered for dates when it is fetched according to the
-constructor option, 'by'.  Make sure that the 'dates' sub-hash given to B<graph>, if used,
-has the same 'by' setting, otherwise there will either be unpredictable gaps in the graph or missing data.
+sub build_graph {
+    my ($o) = @_;
+ 
+    if ($o->{show}) {
+	$o->graph() unless $o->{pgs};
+	
+	foreach my $line (values %{$o->{plines}}) {
+	    $o->{pgs}->add_price_line( $line->{data}, $line->{key}, $line->{style} ) if $line->{show};
+	}
+	foreach my $line (values %{$o->{vlines}}) {
+	    $o->{pgs}->add_volume_line( $line->{data}, $line->{key}, $line->{style} ) if $line->{show};
+	}
+	foreach my $line (values %{$o->{alines}}) {
+	    $o->{pgs}->add_volume_line( $line->{data}, $line->{key}, $line->{style} ) if $line->{show};
+	}
+    }
 
-Example
+    $o->{built} = 1;
+    #$o->show_lines();
+}
 
-    my $sample = new Finance::Shares::Sample(
-	    by => 'days',
-	);
+=head2 build_graph()
 
-    $sample->graph(
-	    dates => {
-		by => 'days',
-	    },
-	);
+Construct the graph and add all lines to it.  This should not need to be called in most circumstances as it is
+called automatically by B<output>.  However, it is provided so that several samples are to be printed to the same
+PostScript::File.  See L<PostScript::Graph::Stock/build_graph>.
+
+Setting the constructor option C<show> to 0 prevents the graph being built.
 
 =cut
 
 sub output {
     my ($o, $file, $dir) = @_;
     $dir = $o->{dir} unless (defined $dir);
-    
-    $o->graph( $o->{opt}{graph} ) unless ($o->{pgs});
-    $o->{pgs}->output($file, $dir);
+   
+    if ($o->{show}) {
+	$o->build_graph() unless $o->{built};
+	$o->{pgs}->output($file, $dir);
+    }
 }
 
 =head2 output( file [, dir] )
@@ -362,28 +767,143 @@ Example 2
     my $graph = $ss->graph();
     $graph->output();
     
+Setting the constructor option C<show> to 0 prevents the graph being built.
+
+=cut
+
+=head1 ACCESS METHODS
+
+See L<DESCRIPTION> for the data items that are directly available.
+
+=cut
+
+sub dates_by {
+    return shift()->{dtype};
+}
+
+=head2 dates_by
+
+Return a string indicating how the dates are spread.  One of 'data', 'days', 'workdays', 'weeks', 'months'.
+
+=cut
+
+sub line_data {
+    my ($o, $chart, @args) = @_;
+    my $lines;
+    if (@args) {
+	if ($chart eq 'price') {
+	    $lines = $o->{plines};
+	} elsif ($chart eq 'volume') {
+	    $lines = $o->{vlines};
+	} elsif ($chart eq 'analysis') {
+	    $lines = $o->{alines};
+	} else {
+	    croak "'price', 'volume' or 'analysis' required\nStopped";
+	}
+
+	my $key = $o->line_key( @args );
+	return $lines->{$key}{data};
+    } else {
+	if ($chart eq 'price') {
+	    return $o->{prices};
+	} elsif ($chart eq 'volume') {
+	    return $o->{volumes};
+	} else {
+	    croak "'price', or 'volume' required\nStopped";
+	}
+    }
+}
+
+=head2 line_data( chart [, func, params] )
+
+Return the requested points data.
+
+C<chart> should be one of 'price', 'volume' or 'analysis'.  C<func> and C<params> are as specified when the line
+was added.
+
+=cut
+
+sub graph_stock {
+    return shift->{pgs};
+}
+
+=head2 graph_stock
+
+Return the PostScript::Graph::Stock object used to output the graph.
+
 =cut
 
 =head1 SUPPORT METHODS
 
 =cut
 
+sub fetch {
+    my ($o, $epic, $start, $end, $table) = @_;
+    $epic = uc($epic);
+    ($table = $epic) =~ s/[^\w]/_/g unless $table;
+    $o->{epic}  = $epic;
+    $o->{table} = $table;
+    $o->{start} = $start;
+    $o->{end}   = $end;
+    
+    ## fetch from database
+    my $request = [ [ $epic, $start, $end, $table ], ];
+    for my $try (1 .. $o->{tries}) {
+	my $failed = $o->{db}->fetch_batch( $request );
+	last unless ($failed);
+    }
+    
+    $o->{cols} = [qw(Qdate Open High Low Close Volume)];
+    $o->{rows} = $o->{db}->select_table($table, $o->{cols}, $start, $end);
+    $o->prepare_dates($o->{rows});
+}
+
+sub from_csv {
+    my ($o, $epic, $file, $dir) = @_;
+    my $filename = check_file($file, $dir);
+    my @data;
+    my $csv = new Text::CSV_XS;
+    open(INFILE, "<", $filename) or die "Unable to open \'$filename\': $!\nStopped";
+    while (<INFILE>) {
+	chomp;
+	my $ok = $csv->parse($_);
+	if ($ok) {
+	    my @row = $csv->fields();
+	    push @data, [ @row ] if (@row);
+	}
+    }
+    close INFILE;
+
+    $o->from_array( $epic, \@data );
+}
+
+sub from_array {
+    my ($o, $epic, $data) = @_;
+    die "Array required\nStopped" unless (defined $data);
+    $o->{epic} = $epic;
+    ($o->{table} = $epic) =~ s/[^\w]/_/g;
+
+    $o->prepare_dates( $data );
+
+    $o->{start} = $o->{dates}[0];
+    $o->{end}   = $o->{dates}[$#{$o->{dates}}];
+}
+
+
 sub prepare_dates {
     my $o    = shift;
     my $data = shift;
-    my $opt  = {};
-    if (@_ == 1) { $opt = $_[0]; } else { %$opt = @_; }
+    my $opt  = $o->{opt}{graph}{dates};
 
     ## identify date options
-    my $dtype = defined($opt->{by}) ? $opt->{by} : "workdays";
-    $o->{dtype} = $dtype;
+    my $dtype = $o->{dtype};
     my ($dsdow, $dsday, $dsmonth, $dsyear, $dsall);
     CASE: {
-	if ($dtype eq 'days') {
+	if ($dtype eq 'alldays') {
 	    ($dsdow, $dsday, $dsmonth, $dsyear) = (1, 1, 1, 0);
 	    last CASE;
 	}
-	if ($dtype eq 'workdays') {
+	if ($dtype eq 'weekdays') {
 	    ($dsdow, $dsday, $dsmonth, $dsyear) = (1, 1, 1, 0);
 	    last CASE;
 	}
@@ -395,7 +915,7 @@ sub prepare_dates {
 	    ($dsdow, $dsday, $dsmonth, $dsyear) = (0, 0, 1, 1);
 	    last CASE;
 	}
-	# ($dtype eq 'data')
+	# ($dtype eq 'data' or 'days')
 	    ($dsdow, $dsday, $dsmonth, $dsyear) = (0, 1, 1, 1);
     }
     $dsdow   = defined($opt->{show_weekday}) ? $opt->{show_weekday}        : $dsdow;
@@ -468,8 +988,8 @@ sub prepare_dates {
 
 	## select dates
 	CASE: {
-	    ## every day
-	    if ($dtype eq 'days') {
+	    ## alldays
+	    if ($dtype eq 'alldays') {
 		if ($known) {
 		    $order{$date} = $x; push @dates, $date;
 		    push @labels, $label; 
@@ -482,8 +1002,8 @@ sub prepare_dates {
 		last CASE;
 	    }
 	    
-	    ## every workday
-	    if ($dtype eq 'workdays') {
+	    ## weekdays
+	    if ($dtype eq 'weekdays') {
 		if ($weekday) {
 		    if ($known) {
 			$order{$date} = $x; push @dates, $date;
@@ -498,7 +1018,7 @@ sub prepare_dates {
 		last CASE;
 	    }
 	    
-	    ## every week
+	    ## weeks
 	    if ($dtype eq 'weeks') {
 		# Each weeks data accumulates until the next week begins.
 		# So at the start of each week, the previous week's data are
@@ -563,7 +1083,7 @@ sub prepare_dates {
 		last CASE;
 	    }
 
-	    ## every month
+	    ## months
 	    if ($dtype eq 'months') {
 		# Each months data accumulates until the next month begins.
 		if ($weekday) {
@@ -613,8 +1133,8 @@ sub prepare_dates {
 		last CASE;
 	    }
 
-	    ## dates given
-	    #  ($dtype eq 'data')
+	    ## days
+	    #  ($dtype eq 'data' or 'days')
 	    if ($known) {
 		$order{$date} = $x; push @dates, $date; 
 		$x++;
@@ -636,16 +1156,28 @@ sub prepare_dates {
 	push @labels, $endlabel;
 	$labelmax = length($endlabel) if (length($endlabel) > $labelmax);
     }
- 
-    $o->{order}  = \%order;
-    $o->{price}  = \%price;
-    $o->{volume} = \%volume;
-    $o->{dates}  = \@dates;
-    $o->{labels} = \@labels;
-    $o->{lblmax} = $labelmax; 
+
+    my (@prices, @volumes, %index);
+    for (my $i = 0; $i <= $#dates; $i++) {
+	my $date = $dates[$i];
+	$index{$date} = $i;
+	push @prices, $price{$date}[3];
+	push @volumes, $volume{$date};
+    }
+  
+    ## data defined
+    $o->{order}   = \%order;	    # maps YYYY-MM-DD date to {labels} index
+    $o->{price}   = \%price;	    # maps YYYY-MM-DD date to array of [open, high, low, close]
+    $o->{volume}  = \%volume;	    # maps YYYY-MM-DD date to volume
+    $o->{idx}     = \%index;	    # maps YYYY-MM-DD date to {dates} index
+    $o->{dates}   = \@dates;	    # array of known dates
+    $o->{prices}  = \@prices;	    # closing prices in {dates} order
+    $o->{volumes} = \@volumes;	    # volumes in {dates} order
+    $o->{labels}  = \@labels;	    # all labels, needed by PostScript::Graph::Stock
+    $o->{lblmax}  = $labelmax;	    # size of longest label, needed by PostScript::Graph::Stock
 }
 
-=head2 prepare_dates( data [,options] )
+=head2 prepare_dates( data )
 
 This splits raw CSV-style data into the date labels, prices and volumes needed for a stock graph.
 C<data> should be a reference to an array of arrays.  The inner arrays should hold a date in YYYY-MM-DD format,
@@ -654,12 +1186,13 @@ opening, high, low and closing prices followed by the volume.  Either the prices
 Example
 
     $data = [
-    [2001-06-01,454.50,475.00,448.50,461.00,8535680],
-    [2001-06-04,465.00,465.00,458.50,459.00,3254045],
-    [2001-06-05,458.25,464.00,455.00,462.00,4615016],
+    ['2001-06-01',454.50,475.00,448.50,461.00,8535680],
+    ['2001-06-04',465.00,465.00,458.50,459.00,3254045],
+    ['2001-06-05',458.25,464.00,455.00,462.00,4615016],
     ];
 
-C<options> may either be a hashref or a list of hash keys and values.  Recognized hash keys follow.
+The dates are filtered and labelled according to the 'dates' sub-hash options passed to the constructor.  Suitable
+values for keys found within 'dates' are processed by this method and so are listed here.
 
 =head3 by
 
@@ -667,15 +1200,15 @@ This string determines how the dates are distributed across the X axis.
 
 =over 4
 
-=item B<data>
+=item B<days>
 
 The dates are those present in the data, in chronological order (the default).
 
-=item B<days>
+=item B<alldays>
 
 Every day between the first and last day is listed, whether there is data for that day or not.
 
-=item B<workdays>
+=item B<weekdays>
 
 Every day except Saturdays and Sundays.  Occasional holidays are ignored, just showing as days with no data.
 
@@ -760,36 +1293,150 @@ The length of the longest label.
 
 =cut
 
-=head1 EXPORTED FUNCTIONS
-
-No export tags are defined and no functions are exported by default.  The functions defined here must be specified
-by name before it can be used.
-
-    use Finance::Shares::Sample qw(ymd_from_string
-				   string_from_ymd);
-
-=cut
-
-sub ymd_from_string {
-    my $date = shift;
-    return ($date =~ /(\d{4})-(\d{2})-(\d{2})/);
+sub known_date {
+    my ($o, $req) = @_;
+    foreach my $date (@{$o->{dates}}) {
+	return $date if ($date ge $req);
+    }
+    return undef;
 }
 
-=head2 ymd_from_string( date )
+=head2 known_date( date )
 
-Takes a string in the form YYYY-MM-DD and returns an array of integers (year, month, day).
+Adjust the YYYY-MM-DD date given to one of the dates with data.  It actually returns the date given or the first
+one after it rather than the closest.  Returns undef if no date is found.
 
 =cut
 
-sub string_from_ymd {
-    return sprintf("%04d-%02d-%02d", @_);
+sub graph {
+    my $o = shift;
+    if ($o->{show}) {
+	my $opt = $o->{opt}{graph};
+	my $epic = $o->{epic};
+	die "No data.  A 'sample', 'file' or 'array' must be given to Finance::Shares::Sample->new.\nStopped" 
+	    unless (defined $epic);
+	my @date = $o->{end} ? ymd_from_string($o->{end}) : Today();
+	my $end_date = Date_to_Text_Long( @date );
+	my $dtype = ucfirst($o->{dtype});
+	$opt->{sample} = $o;
+	$opt->{heading} = "$epic Shares, $dtype to $end_date";
+	$opt->{file}    = {} unless (defined $opt->{file});
+	my $of = $opt->{file};
+	unless (ref($of) eq 'PostScript::File') {
+	    $of->{landscape} = 1 unless (defined $of->{landscape});
+	    $of->{errors}    = 1 unless (defined $of->{errors});
+	}
+	
+	$o->{pgs} = new PostScript::Graph::Stock( $opt );
+    }
+    return $o->{pgs};
 }
 
-=head2 string from_ymd( year, month, day )
+=head2 graph
 
-Converts the three integer values into a YYYY-MM-DD string.
+All options should be given as the constructor option, C<graph>.  This should only need to be called if the
+underlying PostScript::Graph::Stock object (which is returned) is needed.
 
 =cut
+
+
+sub eval_data {
+    my ($o, $chart, $date, $id) = @_;
+    if ($chart eq 'price') {
+	my $i = $pricepos{$id};
+	$i = 3 unless defined $i;
+	return $o->{price}{$date}[$i];
+    } elsif ($chart eq 'volume') {
+	my $i = $o->{idx}{$date};
+	return $o->{volumes}[$i] if defined $i;
+    }
+    return undef;
+}
+# if $chart is 'price', $id may be 'open', 'high', 'low' or 'close'
+
+sub eval_line {
+    my ($o, $chart, $date, $id) = @_;
+    croak "No date to evaluate\nStopped" unless defined $date;
+    croak "No function to evaluate\nStopped" unless $id;
+    my $hash;
+    if ($chart eq 'price') {
+	$hash = $o->{plines};
+    } elsif ($chart eq 'volume') {
+	$hash = $o->{vlines};
+    } elsif ($chart eq 'analysis') {
+	$hash = $o->{alines};
+    } else {
+	croak "Chart not given\nStopped";
+    }
+    return undef unless defined $hash;
+    
+    my $line = $hash->{$id};
+    if (defined $line) {
+	my $i = $o->{idx}{$date};
+	return $line->{data}[$i][1] if defined $i;    
+    }
+    return undef;
+}
+
+sub line_key {
+    no warnings;
+    my $key = join('_', @_);
+    use warnings;
+    return $key;
+}
+# generate key for plines, vlines or alines
+
+### Formats
+our ($slt_chart, $slt_id, $slt_key, $slt_show);
+format Show_Lines_Top =
+Chart    Line Id                        Chart Key                          Show
+======== ============================== ================================== ====
+.
+
+format Show_Lines =
+@<<<<<<< @<<<<<<<<<<<<<<<<<<<<<<<<<<<<< @<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< @>>>
+$slt_chart, $slt_id,                    $slt_key,                          $slt_show
+.
+
+sub show_lines {
+    my $o = shift;
+
+    my $fh = select STDOUT;
+    $~ = 'Show_Lines';
+    $^ = 'Show_Lines_Top';
+    foreach my $key (keys %{$o->{plines}}) {
+	my $line = $o->{plines}{$key};
+	if (defined $line) {
+	    $slt_chart = 'price';
+	    $slt_id    = $key;
+	    $slt_key   = $line->{key}  || '';
+	    $slt_show  = $line->{show} || '';
+	    write STDOUT;
+	}
+    }
+    foreach my $key (keys %{$o->{vlines}}) {
+	my $line = $o->{plines}{$key};
+	if (defined $line) {
+	    $slt_chart = 'volume';
+	    $slt_id    = $key;
+	    $slt_key   = $line->{key}  || '';
+	    $slt_show  = $line->{show} || '';
+	    write STDOUT;
+	}
+    }
+    foreach my $key (keys %{$o->{vlines}}) {
+	my $line = $o->{plines}{$key};
+	if (defined $line) {
+	    $slt_chart = 'analysis';
+	    $slt_id    = $key;
+	    $slt_key   = $line->{key}  || '';
+	    $slt_show  = $line->{show} || '';
+	    write STDOUT;
+	}
+    }
+    $~ = 'STDOUT';
+    $^ = 'STDOUT_TOP';
+}
 
 =head1 BUGS
 
@@ -797,12 +1444,13 @@ Please report those you find to the author.
 
 =head1 AUTHOR
 
-Chris Willmot, chris@willmot.org.uk
+Chris Willmot, chris@willmot.co.uk
 
 =head1 SEE ALSO
 
-L<Finance::Shares::Log>,
-L<Finance::Shares::MySQL> and
+L<Finance::Shares::MySQL>,
+L<Finance::Shares::Model>,
+L<PostScript::Graph::Style> and
 L<PostScript::Graph::Stock>.
 
 =cut
